@@ -1,5 +1,6 @@
 from pymongo import MongoClient, errors
 from datetime import datetime
+from scraper import scrape_article
 import time
 import redis
 import os 
@@ -37,17 +38,34 @@ print("Waiting for messages on 'articles' queue...\n")
 
 while True:
     try:
-        _, message = r.brpop('articles')
+        message = r.brpoplpush("articles", "articles:processing", timeout=0)
         article = json.loads(message)
         
+        # Add timestamps for created_at and updated_at
         now = datetime.now()
 
+        
+        print(f"\nReceived job ID: {article['id']}")
+        print(f"URL: {article['url']}")
+
+        # ----------------------------
+        # Scrape the article
+        # ----------------------------
+        scraped = scrape_article(article["url"])
+        
+        if not scraped:
+            print(f"Scrape failed, skipping: {article['url']}")
+            continue
+        
         # if article is already in the database, update it. 
         # otherwise, insert a new document
         update_fields = {
             "url": article["url"],
             "source": article["source"],
             "category": article["category"],
+            "title": scraped["title"],
+            "content": scraped["content"],
+            "word_count": scraped["word_count"],
             "priority": article["priority"],
             "updated_at": now
         }
@@ -62,7 +80,17 @@ while True:
             },
             upsert=True
         )
-            
+        
+        if result.upserted_id:
+            print(f"[DB] Inserted new article: {article['id']}")
+        else:
+            print(f"[DB] Updated existing article: {article['id']}")
+
+        print("-" * 50)
+        
+        r.lrem("articles:processing", 1, message)
+        print(f"Job {article['id']} completed and removed from processing queue")    
+       
         print("-"*40)
         
     except json.JSONDecodeError:

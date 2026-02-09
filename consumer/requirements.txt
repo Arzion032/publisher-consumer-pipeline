@@ -1,2 +1,5 @@
 redis
 pymongo
+requests
+trafilatura[recommended]
+google-generativeai
