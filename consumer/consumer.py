@@ -1,6 +1,7 @@
 from pymongo import MongoClient, errors
 from datetime import datetime
 from scraper import scrape_article
+from ai_analyzer import analyze_article
 import time
 import redis
 import os 
@@ -39,6 +40,8 @@ print("Waiting for messages on 'articles' queue...\n")
 while True:
     try:
         message = r.brpoplpush("articles", "articles:processing", timeout=0)
+        if message is None:
+            continue
         article = json.loads(message)
         
         # Add timestamps for created_at and updated_at
@@ -57,6 +60,9 @@ while True:
             print(f"Scrape failed, skipping: {article['url']}")
             continue
         
+        analysis = analyze_article(scraped["title"], scraped["content"])
+        analysis_data = json.loads(analysis)
+
         # if article is already in the database, update it. 
         # otherwise, insert a new document
         update_fields = {
@@ -65,6 +71,9 @@ while True:
             "category": article["category"],
             "title": scraped["title"],
             "content": scraped["content"],
+            "summary": analysis_data["summary"],
+            "sentiment": analysis_data["sentiment"],
+            "keywords": analysis_data["keywords"],
             "word_count": scraped["word_count"],
             "priority": article["priority"],
             "updated_at": now
@@ -89,7 +98,7 @@ while True:
         print("-" * 50)
         
         r.lrem("articles:processing", 1, message)
-        print(f"Job {article['id']} completed and removed from processing queue")    
+        print(f"✅ Job {article['id']} completed and removed from processing queue")    
        
         print("-"*40)
         
