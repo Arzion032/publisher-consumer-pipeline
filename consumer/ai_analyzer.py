@@ -3,20 +3,15 @@ import json
 import logging
 import google.generativeai as genai
 
+# Logger configuration
+logger = logging.getLogger("AI_ANALYZER")
+
 # Google Gemini configuration
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
-# AI analysis function
+# Analyze the article
 def analyze_article(title, content, max_content_chars=2000):
-    
-    # Logging configuration
-    logging.basicConfig(
-        level=logging.INFO,
-        format='[AI_ANALYSIS] %(asctime)s %(levelname)s: %(message)s',
-    )
-    logger = logging.getLogger(__name__)
-    
     try:
         prompt = f"""
         You are an information extraction system.
@@ -52,14 +47,16 @@ def analyze_article(title, content, max_content_chars=2000):
         ARTICLE CONTENT:
         {content[:max_content_chars]}
         """
+        # Generate the content
         response = model.generate_content(prompt)
-        logger.info("✅ AI analysis successful for article: %s", title)
+        logger.info("AI analysis successful for article: %s", title)
         
         return response.text
 
     except Exception as e:
-        logger.error("❌AI ANALYSIS FAILED: %s", e)
+        logger.error("AI ANALYSIS FAILED: %s", e)
 
+        # Return the default values if the analysis fails
         return json.dumps({
         "summary": None,
         "sentiment": None,
