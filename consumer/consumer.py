@@ -1,75 +1,149 @@
-from pymongo import MongoClient, errors
-from datetime import datetime
-import time
-import redis
-import os 
 import json
+import logging
+import time
+from datetime import datetime
+import redis
+from pymongo import errors
+from common.connections import create_mongo_collection, create_redis_client
+from common.validation import validate_article_payload
+from scraper import scrape_article
+from ai_analyzer import analyze_article
 
-print("Consumer service started")
+# Logger configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger("CONSUMER")
+#
+# Priority levels
+PRIORITY_LEVELS = [1, 2, 3, 4, 5]
 
-# Redis config
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+# Function to clean LLM response and extract JSON
+def clean_llm_json(text: str) -> str:
+    if not text:
+        return ""
 
-# Mongo config
-MONGO_HOST = os.getenv("MONGO_HOST")
-MONGO_PORT = int(os.getenv("MONGO_PORT", 27017))
-MONGO_DB = os.getenv("MONGO_DB")
-MONGO_COLLECTION = os.getenv("MONGO_COLLECTION")
+    text = text.strip()
 
-# Reddis connection
-r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    # remove ```json ``` from the llm response
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
 
-# Connect to MongoDB
-try:
-    mongo_client = MongoClient(f"mongodb://{MONGO_HOST}:{MONGO_PORT}/")
-    db = mongo_client[MONGO_DB]
-    collection = db[MONGO_COLLECTION]
+    return text
 
-    # Create unique index for idempotency
-    collection.create_index("id", unique=True)
-    print(f"Connected to MongoDB, using DB: {MONGO_DB}, collection: {MONGO_COLLECTION}")
-except errors.ConnectionFailure as e:
-    print("Could not connect to MongoDB:", e)
-    exit(1)
+# Process article function
+def process_article(article):
+    url = article.get("url")
+    if not url:
+        return None
 
-print("Waiting for messages on 'articles' queue...\n")
+    scraped = scrape_article(url)
+    if not scraped:
+        return None
+    
+    analysis_data = {
+        "summary": None,
+        "sentiment": None,
+        "keywords": []
+    }
 
-while True:
     try:
-        _, message = r.brpop('articles')
-        article = json.loads(message)
-        
-        now = datetime.now()
+        # Analyze the article
+        analysis = analyze_article(scraped["title"], scraped["content"])
+        # Clean the LLM response
+        cleaned = clean_llm_json(analysis)
+        # Load the JSON
+        analysis_data = json.loads(cleaned)
+    except Exception as e:
+        logger.warning(f"AI parsing failed: {e}")
 
-        # if article is already in the database, update it. 
-        # otherwise, insert a new document
-        update_fields = {
-            "url": article["url"],
-            "source": article["source"],
-            "category": article["category"],
-            "priority": article["priority"],
-            "updated_at": now
-        }
+    now = datetime.now()
+    # Return the document
+    return {
+        "id": article["id"],
+        "url": url,
+        "source": article["source"],
+        "category": article["category"],
+        "title": scraped["title"],
+        "content": scraped["content"],
+        "summary": analysis_data["summary"],
+        "sentiment": analysis_data["sentiment"],
+        "keywords": analysis_data["keywords"],
+        "word_count": scraped["word_count"],
+        "priority": article["priority"],
+        "created_at": now,
+    }
 
-        result = collection.update_one(
-            {"id": article["id"]},
-            {
-                "$set": update_fields,
-                "$setOnInsert": {
-                    "created_at": now
-                }
-            },
-            upsert=True
-        )
-            
-        print("-"*40)
-        
-    except json.JSONDecodeError:
-        print("Failed to decode message:", message)
-    except redis.exceptions.ConnectionError:
-        print("Lost Redis connection, retrying in 5s...")
-        time.sleep(5)
+def save_document(collection, document, message: str, redis_client):
+    try:
+        # Save the document to the database
+        collection.insert_one(document)
+        logger.info(f"Job {document.get('id')} stored in database")
+    except errors.DuplicateKeyError:
+        logger.info(f"Duplicate id={document.get('id')} detected; treating as already processed")
     except errors.PyMongoError as e:
-        print("MongoDB error:", e)
-        time.sleep(5)
+        logger.error(f"MongoDB error while saving id={document.get('id')}: {e}")
+        redis_client.lpush("articles:failed", message)
+
+def run_worker(r: redis.Redis, collection):
+    logger.info("Consumer service started and waiting for messages...\n")
+    priority_keys = [f"articles:priority:{p}" for p in PRIORITY_LEVELS]
+
+    # Main loop
+    while True:
+        try:
+            # Block until a job arrives, always checking priority-1 first (1 = highest), 
+            # process items FIFO within each individual priority list
+            item = r.blpop(priority_keys, timeout=0)
+            if not item:
+                continue
+
+            # Get the key and message
+            key, message = item
+            # Load the JSON
+            try:
+                article = json.loads(message)
+            except json.JSONDecodeError:
+                # Move the message to the failed list
+                r.lpush("articles:failed", message)
+                logger.warning("Invalid JSON, moved to failed list")
+                continue
+
+            # Validate the payload coming from Redis before processing
+            is_valid, err = validate_article_payload(article)
+            if not is_valid:
+                # Move the message to the failed list
+                r.lpush("articles:failed", message)
+                logger.warning(f"Invalid article payload, moved to failed list: {err}")
+                continue
+
+            # Process the article
+            logger.info(f"Processing job ID: {article.get('id')} | URL: {article.get('url')}")
+            document = process_article(article)
+
+            # If the document is not valid, move the message to the failed list
+            if not document:
+                r.lpush("articles:failed", message)
+                logger.warning("Scrape failed, moved to failed list")
+                continue
+
+            # Save the document to the database
+            save_document(collection, document, message, r)
+
+        except redis.exceptions.ConnectionError:
+            logger.error("Lost Redis connection, retrying in 5s...")
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+
+def main():
+    r = create_redis_client()
+    collection = create_mongo_collection()
+    run_worker(r, collection)
+
+if __name__ == "__main__":
+    main()

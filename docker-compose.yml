@@ -7,6 +7,12 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   mongodb:
     image: mongo:8.2
@@ -16,31 +22,58 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   publisher:
-    build: ./publisher
+    build:
+      context: .
+      dockerfile: ./publisher/Dockerfile
     container_name: publisher
     restart: "no"
     volumes:
-    - ./publisher:/app
-    - ./articles.json:/app/articles.json
+      - ./publisher:/app
+      - ./common:/app/common
     depends_on:
-      - redis
-      - mongodb
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import redis,os; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT',6379))); r.ping()\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   consumer:
-    build: ./consumer
+    build:
+      context: .
+      dockerfile: ./consumer/Dockerfile
     container_name: consumer
     restart: unless-stopped
     volumes:
-    - ./consumer:/app
+      - ./consumer:/app
+      - ./common:/app/common
     depends_on:
-      - redis
-      - mongodb
+      redis:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import redis,os; r=redis.Redis(host=os.getenv('REDIS_HOST','redis'), port=int(os.getenv('REDIS_PORT',6379))); r.ping()\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   mongo_data:
